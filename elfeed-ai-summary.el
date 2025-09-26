@@ -32,7 +32,6 @@
   (declare-function elfeed-entry-tags "elfeed-db" (entry))
   (declare-function elfeed-feed-entries "elfeed-db" (feed))
   (declare-function elfeed-deref "elfeed-db" (ref))
-  (declare-function elfeed-db-search "elfeed-db" (filter &optional oldest newest))
   (declare-function gptel-request "gptel" (prompt &rest args))
   (declare-function org-insert-heading "org" (&optional arg invisible-ok))
   (defvar org-insert-heading-respect-content))
@@ -277,26 +276,93 @@ buffer."
             append (elfeed-ai-summary--normalize-entry-list (elfeed-feed-entries feed)))
    limit))
 
+(defun elfeed-ai-summary--normalize-tags (tags)
+  "Normalize TAGS into a list of unique, non-empty symbols."
+  (let ((result nil))
+    (cl-loop for tag in (elfeed-ai-summary--ensure-list tags)
+             for symbol = (cond
+                           ((null tag) nil)
+                           ((stringp tag)
+                            (let ((trimmed (string-trim tag)))
+                              (unless (string-empty-p trimmed)
+                                (intern trimmed))))
+                           ((symbolp tag) tag)
+                           (t (intern (format "%s" tag))))
+             do (when (and symbol (keywordp symbol))
+                  (let* ((name (symbol-name symbol))
+                         (stripped (and (> (length name) 1)
+                                        (substring name 1))))
+                    (when stripped
+                      (setq symbol (intern stripped)))))
+             when symbol
+             unless (memq symbol result)
+             do (push symbol result)
+             finally return (nreverse result))))
+
+(defun elfeed-ai-summary--entries-from-tags-scan (tags limit)
+  "Collect entries that match TAGS by scanning the Elfeed database.
+LIMIT restricts the number of results when positive."
+  (let ((collected nil)
+        (count 0)
+        (max (and limit (> limit 0) limit)))
+    (when (and tags (fboundp 'with-elfeed-db-visit))
+      (with-elfeed-db-visit (entry _feed)
+        (when (cl-every (lambda (tag)
+                          (memq tag (elfeed-entry-tags entry)))
+                        tags)
+          (push entry collected)
+          (when max
+            (setq count (1+ count))
+            (when (and (fboundp 'elfeed-db-return)
+                       (>= count max))
+              (elfeed-db-return))))))
+    collected))
+
 (defun elfeed-ai-summary--entries-from-tags (tags limit)
   "Collect entries matching TAGS limited to LIMIT results."
-  (let* ((filter (mapconcat (lambda (tag)
-                              (format "+%s" (if (symbolp tag)
-                                                (symbol-name tag)
-                                              tag)))
-                            tags
-                            " "))
-         (entries (when (and (fboundp 'elfeed-db-search)
-                             (not (string-empty-p filter)))
-                    (elfeed-db-search filter))))
-    (elfeed-ai-summary--sort-and-limit entries limit)))
+  (let ((normalized-tags (elfeed-ai-summary--normalize-tags tags)))
+    (when (and normalized-tags (not (fboundp 'with-elfeed-db-visit)))
+      (user-error "Elfeed database helpers are unavailable"))
+    (let ((entries (and normalized-tags
+                        (elfeed-ai-summary--entries-from-tags-scan
+                         normalized-tags limit))))
+      (elfeed-ai-summary--sort-and-limit entries limit))))
+
+(defun elfeed-ai-summary--entries-from-query-scan (query limit)
+  "Collect entries that satisfy QUERY by evaluating it against the database.
+LIMIT restricts the number of results when positive."
+  (require 'elfeed-search nil t)
+  (unless (and (fboundp 'elfeed-search-parse-filter)
+               (fboundp 'with-elfeed-db-visit))
+    (user-error "Elfeed search helpers are unavailable"))
+  (let* ((filter (elfeed-search-parse-filter query))
+         (collected nil)
+         (count 0)
+         (max (and limit (> limit 0) limit))
+         (compiled (when (and (boundp 'elfeed-search-compile-filter)
+                              elfeed-search-compile-filter)
+                     (let ((lexical-binding t))
+                       (byte-compile (elfeed-search-compile-filter filter))))))
+    (with-elfeed-db-visit (entry feed)
+      (when (if compiled
+                (funcall compiled entry feed count)
+              (elfeed-search-filter filter entry feed count))
+        (push entry collected)
+        (setq count (1+ count))
+        (when (and max (>= count max) (fboundp 'elfeed-db-return))
+          (elfeed-db-return))))
+    collected))
 
 (defun elfeed-ai-summary--entries-from-query (query limit)
   "Collect entries by running QUERY string, limiting to LIMIT results."
   (unless (and (stringp query) (not (string-empty-p query)))
     (user-error "Invalid query for elfeed-ai-summary"))
-  (unless (fboundp 'elfeed-db-search)
-    (user-error "elfeed-db-search is unavailable"))
-  (elfeed-ai-summary--sort-and-limit (elfeed-db-search query) limit))
+  (let ((entries (cond
+                  ((fboundp 'with-elfeed-db-visit)
+                   (elfeed-ai-summary--entries-from-query-scan query limit))
+                  (t
+                   (user-error "Elfeed search helpers are unavailable")))))
+    (elfeed-ai-summary--sort-and-limit entries limit)))
 
 (defun elfeed-ai-summary--summary-entries-at-point ()
   "Return a list of recent entries for the summary item at point."
@@ -371,24 +437,32 @@ buffer."
            (with-current-buffer origin
              (elfeed-ai-summary--display-summary summary))))))))
 
+(defun elfeed-ai-summary--collect-all-tags ()
+  "Return all tag symbols currently present in the Elfeed database."
+  (when (fboundp 'with-elfeed-db-visit)
+    (let ((table (make-hash-table :test #'eq)))
+      (with-elfeed-db-visit (entry _feed)
+        (dolist (tag (elfeed-entry-tags entry))
+          (puthash tag t table)))
+      (let (result)
+        (maphash (lambda (tag _value) (push tag result)) table)
+        (sort result
+              (lambda (a b)
+                (string-lessp (symbol-name a)
+                              (symbol-name b))))))))
+
 (defun elfeed-ai-summary--all-tags ()
   "Return a list of all known Elfeed tags as strings."
-  (cond
-   ((and (fboundp 'elfeed-db-get-all-tags)
-         (elfeed-db-get-all-tags))
-    (mapcar (lambda (tag)
-              (if (symbolp tag) (symbol-name tag) (format "%s" tag)))
-            (elfeed-db-get-all-tags)))
-   ((not (fboundp 'elfeed-db-search))
-    (user-error "elfeed-db-search is unavailable"))
-   (t
-    (let ((table (make-hash-table :test #'equal)))
-      (dolist (entry (elfeed-ai-summary--sort-and-limit (elfeed-db-search "") nil))
-        (dolist (tag (elfeed-entry-tags entry))
-          (puthash (if (symbolp tag) (symbol-name tag) (format "%s" tag)) t table)))
-      (let (result)
-        (maphash (lambda (key _value) (push key result)) table)
-        (sort result #'string-lessp))))))
+  (let* ((symbols (or (and (fboundp 'elfeed-db-get-all-tags)
+                            (ignore-errors (elfeed-db-get-all-tags)))
+                      (elfeed-ai-summary--collect-all-tags)))
+         (strings (mapcar (lambda (tag)
+                            (if (symbolp tag)
+                                (symbol-name tag)
+                              (format "%s" tag)))
+                          (or symbols '()))))
+    (sort (cl-remove-duplicates strings :test #'string=)
+          #'string-lessp)))
 
 (defun elfeed-ai-summary--insert-org-report (summary)
   "Insert SUMMARY into the current Org buffer as a new heading."
@@ -414,7 +488,7 @@ When called interactively prompt for tags using completion."
   (elfeed-ai-summary--ensure-dependencies)
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be run from an Org buffer"))
-  (let* ((tag-symbols (mapcar #'intern tags))
+  (let* ((tag-symbols (elfeed-ai-summary--normalize-tags tags))
          (entries (elfeed-ai-summary--entries-from-tags
                    tag-symbols
                    elfeed-ai-summary-category-feeds-count)))
